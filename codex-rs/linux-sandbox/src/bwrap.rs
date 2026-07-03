@@ -568,6 +568,13 @@ fn create_filesystem_args(
         bwrap_args.args.push(path_to_string(mount_root));
         bwrap_args.args.push(path_to_string(mount_root));
 
+        // Protected metadata masks are directory-only. A writable file root
+        // has no children, so paths like `<file>/.codex` are invalid bwrap
+        // targets.
+        if !mount_root.is_dir() {
+            continue;
+        }
+
         let mut read_only_subpaths: Vec<PathBuf> = writable_root
             .read_only_subpaths
             .iter()
@@ -1903,6 +1910,57 @@ mod tests {
             !args.args.iter().any(|arg| arg == &missing_root),
             "missing writable root should be skipped",
         );
+    }
+
+    #[test]
+    fn writable_file_roots_do_not_synthesize_metadata_children() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let codex_dir = temp_dir.path().join(".codex");
+        let config_file = codex_dir.join("config.toml");
+        std::fs::create_dir(&codex_dir).expect("create .codex dir");
+        std::fs::write(&config_file, "model = \"codex\"\n").expect("create config file");
+
+        let config_root =
+            AbsolutePathBuf::from_absolute_path(&config_file).expect("absolute config file");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: config_root },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
+        let config_file_str = path_to_string(&config_file);
+
+        assert!(
+            args.args.windows(3).any(|window| {
+                window == [
+                    "--bind",
+                    config_file_str.as_str(),
+                    config_file_str.as_str(),
+                ]
+            }),
+            "writable file root should still be rebound writable: {:#?}",
+            args.args
+        );
+        for metadata_name in [".git", ".agents", ".codex"] {
+            let invalid_child = path_to_string(&config_file.join(metadata_name));
+            assert!(
+                !args.args.iter().any(|arg| arg == &invalid_child),
+                "writable file roots must not synthesize child metadata targets: {:#?}",
+                args.args
+            );
+        }
+        assert_eq!(synthetic_mount_target_paths(&args), Vec::<PathBuf>::new());
+        assert_eq!(protected_create_target_paths(&args), Vec::<PathBuf>::new());
     }
 
     #[test]
